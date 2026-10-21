@@ -31,10 +31,12 @@ def apply(fan_iface, targets, settle=1.5):
     """targets: list of (fan_number, duty).
 
     Each fan gets its own SetFanControl call, so the other fan keeps its mode.
-    Records the resulting gear in fanstate.ini so fanspeed can display it.
-    Returns (applied, failed).
+    Nothing is written to disk: the gear that is now in effect is published
+    by the running governor on the shared-memory bus, and a one-shot change
+    like this one has nothing to keep alive afterwards.
+    Returns True when everything went through.
     """
-    applied, failed = [], False
+    failed = False
     for number, duty in targets:
         try:
             status = fan_iface.set_duty(number, duty)
@@ -44,14 +46,10 @@ def apply(fan_iface, targets, settle=1.5):
             continue
         if status == 0:
             print("  fan%d  %-22s ok" % (number, fan.describe(duty)))
-            applied.append((number, duty))
         else:
             print("  fan%d  %-22s firmware rejected it (ResultStatus=%d)"
                   % (number, fan.describe(duty), status))
             failed = True
-
-    if applied:
-        _record(applied)
 
     if settle > 0:
         time.sleep(settle)
@@ -61,19 +59,7 @@ def apply(fan_iface, targets, settle=1.5):
                   % (fan.format_rpm(fan1), fan.format_rpm(fan2)))
         except fan.FanError:
             pass
-    return applied, failed
-
-
-def _record(applied):
-    """Update fanstate.ini, keeping the value of any fan we did not touch."""
-    state = fan.read_state() or {}
-    duties = dict(applied)
-    cpu = duties.get(fan.FAN_CPU, state.get("cpu"))
-    mem = duties.get(fan.FAN_MEM, state.get("mem"))
-    if fan.write_state(cpu, mem, "fanctl"):
-        print("  recorded: CPU=%s memory=%s -> %s"
-              % (fan.setting_label(cpu), fan.setting_label(mem),
-                 fan.STATE_FILE))
+    return not failed
 
 
 def main(argv=None) -> int:
@@ -137,11 +123,17 @@ def main(argv=None) -> int:
             fan.report(fan_iface)
             return fan.EXIT_OK
 
+        if fan.service_running():
+            # The governor drives the fans itself; whatever is set here is
+            # overwritten within a tick.
+            print("  NOTE: the %s service is running and will overwrite "
+                  "this within a few seconds." % fan.SERVICE_NAME)
+            print("        stop it first:  net stop %s" % fan.SERVICE_NAME)
+
         plan = ", ".join("%s -> %s" % (fan.FAN_LABEL[n], fan.describe(d))
                          for n, d in targets)
         fan.title("Applying  (%s)" % plan)
-        applied, failed = apply(fan_iface, targets)
-        return fan.EXIT_ERROR if failed else fan.EXIT_OK
+        return fan.EXIT_OK if apply(fan_iface, targets) else fan.EXIT_ERROR
 
     except fan.AccessDenied as exc:
         print("ERROR: %s" % exc, file=sys.stderr)

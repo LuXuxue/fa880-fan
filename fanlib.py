@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import contextlib
 import ctypes
 import os
 import sys
@@ -125,6 +126,16 @@ class FrameWriter:
         """Print a one-off line above the live area."""
         sys.stdout.write(text + "\n")
         sys.stdout.flush()
+
+
+class NullWriter:
+    """Discards everything -- for the service, which has no console."""
+
+    def write(self, text: str) -> None:
+        pass
+
+    def banner(self, text: str) -> None:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -243,13 +254,22 @@ def is_admin() -> bool:
         return False
 
 
-def _spawn_elevated(extra_args=None):
+def _spawn_elevated(extra_args=None, quiet=False):
     """ShellExecuteEx('runas') this script again.
+
+    The child's output is relayed back through a file, because the elevated
+    child gets a hidden console of its own.  With quiet=True the caller has
+    no console to show that output in (pythonw), so the file is skipped
+    entirely and the child writes to the null device instead -- a relay log
+    that nobody reads is pure disk traffic.
 
     Returns (info, log_path) on success, or (None, None) if UAC was declined.
     """
-    handle, log_path = tempfile.mkstemp(prefix="fanctl-", suffix=".log")
-    os.close(handle)
+    if quiet:
+        log_path = os.devnull                 # "nul" -- nothing hits the disk
+    else:
+        handle, log_path = tempfile.mkstemp(prefix="fanctl-", suffix=".log")
+        os.close(handle)
 
     # lpFile is the interpreter, so lpParameters must hold the SCRIPT and its
     # arguments only -- including sys.executable here would make the child run
@@ -278,19 +298,27 @@ def _spawn_elevated(extra_args=None):
     if not shell32.ShellExecuteExW(ctypes.byref(info)):
         print("UAC elevation was declined or failed (error %d)."
               % ctypes.get_last_error(), file=sys.stderr)
-        try:
-            os.unlink(log_path)
-        except OSError:
-            pass
+        if not quiet:
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
         return None, None
     return info, log_path
 
 
-def _exit_code(info) -> int:
+def _exit_code(handle) -> int:
     code = wintypes.DWORD()
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+    k32.GetExitCodeProcess(handle, ctypes.byref(code))
     return int(code.value)
+
+
+def _wait_for_child(handle) -> int:
+    """Wait for the elevated child to exit and return its exit code."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.WaitForSingleObject(handle, _INFINITE)
+    return _exit_code(handle)
 
 
 def elevate_once() -> int:
@@ -302,7 +330,7 @@ def elevate_once() -> int:
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     try:
         k32.WaitForSingleObject(info.hProcess, _INFINITE)
-        code = _exit_code(info)
+        code = _exit_code(info.hProcess)
 
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
@@ -362,27 +390,36 @@ def relay_child_output(handle, log_path) -> int:
         rc = 130
         # Do not wait for the child here.  It watches us through --parent-pid
         # and shuts down within a fraction of a second of our exit (fanguard
-        # restores AUTO on its way out).  Only fanguard honours the stop-file
-        # channel -- fanspeed does not -- so waiting for it would freeze the
+        # restores AUTO on its way out), so waiting for it would freeze the
         # window for the full timeout on every Ctrl+C.
         pass
     return rc
 
 
-def elevate_stream() -> int:
-    """Run elevated and stream its output live until the child exits."""
+def elevate_stream(quiet: bool = False) -> int:
+    """Run elevated and stream its output live until the child exits.
+
+    With quiet=True the child's output is thrown away instead of being
+    relayed: the caller has no console to show it in, so routing it through
+    a file in %TEMP% would only cost disk writes.  The child is still
+    waited for -- it watches our death and would stop the fans otherwise.
+    """
     extra = ["--ansi"] if _stdout_is_tty() else []
-    info, log_path = _spawn_elevated(extra)
+    info, log_path = _spawn_elevated(extra, quiet=quiet)
     if info is None:
         return EXIT_ERROR
 
-    rc = relay_child_output(info.hProcess, log_path)
+    if quiet:
+        rc = _wait_for_child(info.hProcess)
+    else:
+        rc = relay_child_output(info.hProcess, log_path)
 
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     try:
         k32.WaitForSingleObject(info.hProcess, 5000)
         k32.CloseHandle(info.hProcess)
-        os.unlink(log_path)
+        if not quiet:
+            os.unlink(log_path)
     except OSError:
         pass
     return rc
@@ -426,14 +463,17 @@ def parent_gone(handle) -> bool:
     return k32.WaitForSingleObject(handle, 0) != _WAIT_TIMEOUT
 
 
-def ensure_admin():
+def ensure_admin(reason=None):
     """If we are not elevated, re-launch elevated and return the new exit code.
 
     Returns None when the caller may proceed.
     """
     if is_admin():
         return None
-    print("This tool needs Administrator to touch root\\WMI %s." % WMI_CLASS)
+    if reason:
+        print(reason)
+    else:
+        print("This tool needs Administrator to touch root\\WMI %s." % WMI_CLASS)
     print("Requesting elevation...")
     return elevate_once()
 
@@ -599,6 +639,27 @@ def setting_label(duty) -> str:
     return "%d%%" % duty
 
 
+def parse_gear(text) -> int:
+    """'AUTO' -> 101, 'MAX' -> 100, '70%' -> 70, anything else -> None.
+
+    The governor publishes the gear it applied as a label, so this is the
+    way back from a telemetry sample to the duty value.
+    """
+    if text is None:
+        return None
+    text = str(text).strip()
+    if not text or text == "?":
+        return None
+    if text.upper() == "AUTO":
+        return DUTY_AUTO
+    if text.upper() == "MAX":
+        return DUTY_MAX
+    try:
+        return int(text.rstrip("%"))
+    except ValueError:
+        return None
+
+
 # --------------------------------------------------------------------------
 # rendering helpers
 # --------------------------------------------------------------------------
@@ -606,9 +667,9 @@ def setting_label(duty) -> str:
 BAR_WIDTH = 28
 
 
-def rpm_bar(rpm: int, full_scale: int, width: int = BAR_WIDTH) -> str:
+def rpm_bar(rpm, full_scale, width=BAR_WIDTH) -> str:
     """A gauge where full_scale means 100 % -- pass each fan's own ceiling."""
-    if rpm <= 0:
+    if not rpm or rpm <= 0:
         return "[" + "." * width + "]"
     if full_scale <= 0:
         full_scale = 1
@@ -616,46 +677,50 @@ def rpm_bar(rpm: int, full_scale: int, width: int = BAR_WIDTH) -> str:
     return "[" + "#" * filled + "." * (width - filled) + "]"
 
 
-def format_rpm(rpm: int) -> str:
+def format_rpm(rpm) -> str:
+    """rpm is an int, or None when the reading could not be taken."""
+    if rpm is None:
+        return "?"
     return "%d RPM" % rpm if rpm else "stopped"
 
 
-def fan_rows(fan1: int, fan2: int, state=None) -> list:
-    """The two fan lines: RPM gauge plus the last-known setting gear."""
-    cpu_duty = state.get("cpu") if state else None
-    mem_duty = state.get("mem") if state else None
+def fan_rows(fan1, fan2, cpu=None, mem=None) -> list:
+    """The two fan lines: RPM gauge plus the gear, when it is known.
+
+    cpu/mem are duty values (or None when the gear cannot be told); the RPMs
+    are ints, or None when the reading could not be taken.
+    """
     return [
         "  %-12s %s  %-9s  of %-5s %s" % (
             FAN_LABEL[FAN_CPU], rpm_bar(fan1, FAN_FULL_SCALE[FAN_CPU]),
             format_rpm(fan1), FAN_FULL_SCALE[FAN_CPU],
-            setting_label(cpu_duty)),
+            setting_label(cpu)),
         "  %-12s %s  %-9s  of %-5s %s" % (
             FAN_LABEL[FAN_MEM], rpm_bar(fan2, FAN_FULL_SCALE[FAN_MEM]),
             format_rpm(fan2), FAN_FULL_SCALE[FAN_MEM],
-            setting_label(mem_duty)),
+            setting_label(mem)),
     ]
 
 
-def state_note(state) -> str:
+def gear_note(cpu=None, mem=None, source=None) -> str:
     """One line saying where the displayed gear came from."""
-    if not state:
-        return ("  setting: unknown (nothing recorded yet -- run fanctl or "
-                "fanguard)")
-    who = state.get("by") or "?"
-    age = state.get("age", -1)
-    when = "%ds ago" % age if age >= 0 else "unknown time"
-    return "  setting: last set by %s (%s)" % (who, when)
+    if cpu is None and mem is None:
+        return ("  setting: unknown -- the firmware reports RPM only, and no "
+                "governor is publishing the gear it applied")
+    where = " (%s)" % source if source else ""
+    return "  setting: CPU %s, memory %s%s" % (setting_label(cpu),
+                                                setting_label(mem), where)
 
 
 def report(fan: FanInterface) -> None:
     """One-shot snapshot of both fans."""
     fan1, fan2 = fan.get_rpm()
-    state = read_state()
+    cpu, mem, source = live_gears()
     title("Fan status")
     print("  instance      : %s" % fan.instance)
-    for row in fan_rows(fan1, fan2, state):
+    for row in fan_rows(fan1, fan2, cpu, mem):
         print(row)
-    print(state_note(state))
+    print(gear_note(cpu, mem, source))
     print("  raw FanDuty   : 0x%08X   (fan1 = low 16 bits, fan2 = high 16)"
           % fan.last_packed)
     print("  gauges are scaled to each fan's own MAX duty plateau.")
@@ -670,49 +735,122 @@ def report(fan: FanInterface) -> None:
 # keeps the second one out.  The kernel drops it when the process dies, so
 # a force-kill cannot leave a stale lock behind.
 
-SINGLE_INSTANCE_NAME = "Local\\fa880-fan-fanguard"
+# The governor may run as a Windows service, which lives in session 0, while
+# the tools run in the user's session.  Objects in the "Local\" namespace are
+# per session, so the two would never meet: the service has to use the
+# global namespace instead.
+#
+# Creating a global object needs the SeCreateGlobalPrivilege, which only
+# services have -- a user process cannot create one, but it may open one.
+# So every name is tried in turn and the first one that works is used.
+GLOBAL_TELEMETRY_NAME = "Global\\fa880-fan-telemetry"
+GLOBAL_MUTEX_NAME = "Global\\fa880-fan-fanguard"
+LOCAL_TELEMETRY_NAME = "Local\\fa880-fan-telemetry"
+LOCAL_MUTEX_NAME = "Local\\fa880-fan-fanguard"
 
-_ERROR_ALREADY_EXISTS = 183
+TELEMETRY_NAMES = (GLOBAL_TELEMETRY_NAME, LOCAL_TELEMETRY_NAME)
+MUTEX_NAMES = (GLOBAL_MUTEX_NAME, LOCAL_MUTEX_NAME)
+
+_WAIT_OBJECT_0 = 0
 
 
-def acquire_single_instance(name=SINGLE_INSTANCE_NAME):
+def acquire_single_instance(names=MUTEX_NAMES):
     """Claim the right to be the only running governor.
 
-    -> (handle, message).  handle is None when another instance already
-    holds it.  Keep the handle for as long as you want the lock.
+    -> (handles, message).  handles is None when another instance already
+    holds the lock.  Keep the handles for as long as you want the lock.
+
+    Every name is tried: the global one first (that is what a service in
+    session 0 uses), then the session-local one.  A user process cannot
+    *create* a global object, but it may open one -- so when the creation
+    fails for lack of the privilege, the name is probed instead, and an
+    existing lock is still found.
+
+    Note that a mutex which merely *exists* is not a lock: the object stays
+    behind as long as any handle to it is open, so ownership is tested by
+    trying to take it.
     """
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateMutexW.restype = wintypes.HANDLE
-    k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL,
-                                 wintypes.LPCWSTR]
+    k32.CreateMutexW.argtypes = [ctypes.POINTER(SECURITY_ATTRIBUTES),
+                                 wintypes.BOOL, wintypes.LPCWSTR]
+    k32.OpenMutexW.restype = wintypes.HANDLE
+    k32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                wintypes.LPCWSTR]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.ReleaseMutex.argtypes = [wintypes.HANDLE]
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
 
-    ctypes.set_last_error(0)
-    handle = k32.CreateMutexW(None, False, name)
-    if not handle:
-        return None, ("could not create the single-instance mutex "
-                      "(error %d)" % ctypes.get_last_error())
-    if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
-        k32.CloseHandle(handle)
-        return None, "another fanguard instance is already running"
-    return handle, "single-instance lock acquired"
+    handles = []
+    with security_attributes(mutex_sddl()) as attributes:
+        for index, name in enumerate(names):
+            ctypes.set_last_error(0)
+            handle = k32.CreateMutexW(
+                ctypes.byref(attributes) if attributes else None, False, name)
+            if handle:
+                if k32.WaitForSingleObject(handle, 0) != _WAIT_OBJECT_0:
+                    # Somebody else holds it.
+                    k32.CloseHandle(handle)
+                    release_single_instance(handles)
+                    return None, ("another fanguard instance is already "
+                                  "running")
+                handles.append(handle)
+                continue
+            error = ctypes.get_last_error()
+            # Cannot create it -- but it may exist already, and then a
+            # governor is running.  A user process cannot create global
+            # objects at all.
+            #
+            # Only the existence can be checked here: a handle opened with
+            # just SYNCHRONIZE access cannot test the ownership (a mutex
+            # needs MUTEX_MODIFY_STATE for that).  In practice the two are
+            # the same thing, because a governor holds its handle for its
+            # whole life.
+            probe = k32.OpenMutexW(_SYNCHRONIZE, False, name)
+            if probe:
+                k32.CloseHandle(probe)
+                release_single_instance(handles)
+                return None, ("another fanguard instance is already "
+                              "running")
+            if index + 1 < len(names):
+                continue          # try the next name
+            release_single_instance(handles)
+            return None, ("could not create the single-instance mutex "
+                          "(error %d)" % error)
+    return handles, "single-instance lock acquired"
 
 
-def release_single_instance(handle) -> None:
-    if handle:
+def release_single_instance(handles) -> None:
+    if not handles:
+        return
+    if not isinstance(handles, (list, tuple)):
+        handles = [handles]
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    for handle in handles:
         try:
-            ctypes.WinDLL("kernel32").CloseHandle(handle)
+            k32.ReleaseMutex(handle)
+        except Exception:
+            pass
+        try:
+            k32.CloseHandle(handle)
         except Exception:
             pass
 
 
-def governor_present(name=SINGLE_INSTANCE_NAME) -> bool:
-    """True if some process holds the single-instance mutex.
+def governor_present(names=MUTEX_NAMES) -> bool:
+    """True if the single-instance lock is alive, i.e. a governor is running.
 
     This is the authoritative "a governor is running" signal.  The telemetry
     bus only proves that somebody published recently, so a governor that is
     alive but wedged (hung sensor driver, stuck WMI call) would look dead
     there while it still holds the lock and still owns the fans.
+
+    The lock object only goes away when the last handle to it is closed, and
+    a governor keeps its handle for its whole life -- so the object being
+    there says the same thing as somebody owning it.
 
     Probed with OpenMutexW(SYNCHRONIZE) rather than CreateMutexW:
       * OpenMutexW never creates the object, so a probe cannot make a
@@ -726,35 +864,12 @@ def governor_present(name=SINGLE_INSTANCE_NAME) -> bool:
                                 wintypes.LPCWSTR]
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
 
-    handle = k32.OpenMutexW(_SYNCHRONIZE, False, name)
-    if not handle:
-        return False
-    k32.CloseHandle(handle)
-    return True
-
-
-def _state_dir():
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    return os.path.join(base, "fa880-fan")
-
-
-# --------------------------------------------------------------------------
-# stop request channel
-# --------------------------------------------------------------------------
-# Touching this file asks a running fanguard to stop.  It is the only way to
-# stop a windowless background instance cleanly: killing it outright would
-# skip the "hand the fans back to AUTO" cleanup.  It is also how an elevating
-# launcher asks its elevated child to shut down.
-#
-# It lives in the per-user state directory for the same reason the state file
-# does: the tool directory must stay static and usable read-only.
-
-STOP_FILE = os.path.join(_state_dir(), "fanguard.stop")
-
-
-def stop_requested(path=STOP_FILE) -> bool:
-    """True when somebody asked the governor to stop."""
-    return os.path.exists(path)
+    for name in names:
+        handle = k32.OpenMutexW(_SYNCHRONIZE, False, name)
+        if handle:
+            k32.CloseHandle(handle)
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -817,120 +932,197 @@ def close_requested() -> bool:
 
 
 # --------------------------------------------------------------------------
-# last-known fan setting
+# kernel object permissions
 # --------------------------------------------------------------------------
-# There is no way to read the duty back: GetFanControl returns packed *RPM*,
-# not the setting, and PowerSwitchInterface exposes no getter for it.  So the
-# tools that set the fans record what they set here and fanspeed displays it.
-#
-# It lives in the per-user state directory rather than next to the scripts, so
-# the tool directory stays completely static and can be read-only, zipped or
-# dropped into Program Files without dragging a runtime file along.
-#
-# The boot time is stored alongside, so a stale file (after a reboot, or after
-# something else changed the setting) is reported as unknown instead of
-# lying.
+# The governor may run as a Windows service, i.e. as LocalSystem, while
+# fanspeed runs as the logged-on user.  A named object created by SYSTEM
+# inherits SYSTEM's default DACL, and a medium-integrity user cannot open
+# that -- so the telemetry bus and the single-instance mutex are created
+# with an explicit DACL instead.
+
+class SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("nLength", wintypes.DWORD),
+                ("lpSecurityDescriptor", ctypes.c_void_p),
+                ("bInheritHandle", wintypes.BOOL)]
 
 
-STATE_FILE = os.path.join(_state_dir(), "fanstate.ini")
+# The access rights are written out in hex, because SDDL's short aliases
+# are a trap: "SD" means DELETE, and SYNCHRONIZE has no alias at all -- the
+# word is rejected by the SDDL parser (error 1336).
+SYNCHRONIZE_MASK = "0x00100000"
+
+TELEMETRY_SDDL = "D:(A;;GA;;;WD)"
+MUTEX_SDDL = ("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;%s;;;WD)" % SYNCHRONIZE_MASK)
 
 
-def boot_time() -> float:
-    """Seconds since the epoch for the current boot."""
+@contextlib.contextmanager
+def security_attributes(sddl):
+    """SECURITY_ATTRIBUTES for a named kernel object, or None on failure.
+
+    The descriptor is built from an SDDL string:
+
+        "D:(A;;GA;;;WD)"
+            everyone may read and write  (the telemetry bus: it carries
+            nothing but temperatures and fan speeds)
+
+        "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;WD)"
+            SYSTEM and the administrators group have full control, everyone
+            else may only open it for synchronisation -- enough to probe
+            whether a governor is running, not enough to steal its lock
+
+    The descriptor is freed when the block ends: it only has to stay alive
+    while the object is being created.
+    """
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = \
+        ctypes.c_void_p
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    descriptor = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, 1, ctypes.byref(descriptor), None):
+        yield None
+        return
+
+    attributes = SECURITY_ATTRIBUTES()
+    attributes.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+    attributes.lpSecurityDescriptor = descriptor
+    attributes.bInheritHandle = False
     try:
-        k32 = ctypes.WinDLL("kernel32")
-        k32.GetTickCount64.restype = ctypes.c_ulonglong
-        return time.time() - k32.GetTickCount64() / 1000.0
+        yield attributes
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _current_user_sid():
+    """The SID of the account this process runs as, as an SDDL string."""
+    try:
+        import win32api
+        import win32security
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32security.TOKEN_QUERY)
+        sid = win32security.GetTokenInformation(
+            token, win32security.TokenUser)[0]
+        return win32security.ConvertSidToStringSid(sid)
     except Exception:
-        return 0.0
-
-
-def write_state(cpu, mem, who="", path=STATE_FILE) -> bool:
-    """Record the duty each fan was last set to.  Never raises."""
-    try:
-        folder = os.path.dirname(path)
-        if folder and not os.path.isdir(folder):
-            os.makedirs(folder, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write("boot=%.0f\n" % boot_time())
-            fh.write("cpu=%s\n" % ("" if cpu is None else cpu))
-            fh.write("mem=%s\n" % ("" if mem is None else mem))
-            fh.write("by=%s\n" % who)
-            fh.write("at=%s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
-        return True
-    except OSError:
-        return False
-
-
-def read_state(path=STATE_FILE):
-    """-> dict with cpu/mem/by/age, or None if absent or written before boot."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            fields = dict(line.strip().split("=", 1)
-                          for line in fh if "=" in line)
-    except (OSError, ValueError):
         return None
 
-    try:
-        if abs(float(fields.get("boot", "0")) - boot_time()) > 5:
-            return None                      # written before the last reboot
-    except ValueError:
-        return None
 
-    def as_int(name):
+def mutex_sddl():
+    """The SDDL for the single-instance mutex.
+
+    SYSTEM and the administrators group get full control, everybody else
+    may only open it for synchronisation -- enough to ask whether a
+    governor is running, not enough to steal its lock.
+
+    The creator needs full control as well: an explicit DACL grants nothing
+    by itself, so the account that creates the mutex is put into it.
+    """
+    sid = _current_user_sid()
+    if sid:
+        return ("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;%s)(A;;%s;;;WD)"
+                % (sid, SYNCHRONIZE_MASK))
+    return MUTEX_SDDL
+
+
+# --------------------------------------------------------------------------
+# Windows service
+# --------------------------------------------------------------------------
+# The governor may run as a Windows service, so the tools that report or
+# change the fan state want to know what that service is doing.
+#
+# Reading a service's state needs no elevation: every user may query the
+# status of a service.
+
+SERVICE_NAME = "fa880-fan"
+
+SERVICE_STATE_NAMES = {
+    1: "STOPPED",
+    2: "START_PENDING",
+    3: "STOP_PENDING",
+    4: "RUNNING",
+    5: "CONTINUE_PENDING",
+    6: "PAUSE_PENDING",
+    7: "PAUSED",
+}
+
+
+def service_state(name=SERVICE_NAME):
+    """-> the state of a Windows service ("RUNNING", "STOPPED", ...).
+
+    None means the service is not installed (or cannot be queried).
+    Reading a service's state needs no elevation.
+    """
+    try:
+        import win32service
+        hscm = win32service.OpenSCManager(None, None,
+                                          win32service.SC_MANAGER_CONNECT)
         try:
-            return int(fields.get(name, "").strip())
-        except ValueError:
+            handle = win32service.OpenService(
+                hscm, name, win32service.SERVICE_QUERY_STATUS)
+        except Exception:
             return None
+        try:
+            status = win32service.QueryServiceStatus(handle)
+        finally:
+            win32service.CloseServiceHandle(handle)
+        return SERVICE_STATE_NAMES.get(status[1], "?")
+    except Exception:
+        return None
 
-    try:
-        at = time.mktime(time.strptime(fields.get("at", "").strip(),
-                                       "%Y-%m-%d %H:%M:%S"))
-        age = max(0, int(time.time() - at))
-    except ValueError:
-        age = -1
 
-    return {"cpu": as_int("cpu"), "mem": as_int("mem"),
-            "by": fields.get("by", "").strip(), "age": age}
+def service_running(name=SERVICE_NAME) -> bool:
+    """True when the governor service is up and running."""
+    return service_state(name) == "RUNNING"
 
 
 # --------------------------------------------------------------------------
 # live telemetry bus
 # --------------------------------------------------------------------------
-# fanguard (elevated) publishes its latest sample here; fanspeed (which would
+# The governor publishes its latest sample here; fanspeed (which would
 # otherwise need Administrator just to read RPMs) picks it up without ever
 # touching WMI or the disk.
 #
-# A named file mapping is used because it carries no security prompt and needs
-# no file on disk.  Medium-integrity readers can open a mapping created by an
-# elevated writer for the same account -- verified on this machine.
+# A named file mapping is used because it carries no security prompt and
+# needs no file on disk.  The writer is usually the service, which runs as
+# LocalSystem in session 0, so the mapping lives in the global namespace
+# (see TELEMETRY_NAMES) and carries an explicit DACL that lets the
+# logged-on user read it.
 #
 # Layout:  [uint32 seq][uint32 length][payload ...]
 # The writer bumps `seq` last, so a reader that sees the same seq before and
 # after the copy knows it did not tear.
 
-TELEMETRY_NAME = "Local\\fa880-fan-telemetry"
 TELEMETRY_CAPACITY = 1024
 TELEMETRY_MAX_AGE = 20.0          # seconds before a sample counts as stale
 
 FILE_MAP_READ = 0x0002
 FILE_MAP_ALL_ACCESS = 0x000F001F
 
+# The names themselves (and why there is a global and a session-local one)
+# are defined with the single-instance guard further up.
+
 
 class TelemetryBus:
     """Named shared memory holding fanguard's most recent sample."""
 
-    def __init__(self, name=TELEMETRY_NAME, capacity=TELEMETRY_CAPACITY):
-        self.name = name
+    def __init__(self, capacity=TELEMETRY_CAPACITY, names=None):
         self.capacity = capacity
+        # The global name first: that is the one a service uses, and the
+        # one the tools have to find.
+        self.names = tuple(names) if names else TELEMETRY_NAMES
         self._handle = None
         self._ptr = None
         self._seq = 0
         self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._k32.CreateFileMappingW.restype = wintypes.HANDLE
         self._k32.CreateFileMappingW.argtypes = [
-            wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-            wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR]
+            wintypes.HANDLE, ctypes.POINTER(SECURITY_ATTRIBUTES),
+            wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR]
         self._k32.OpenFileMappingW.restype = wintypes.HANDLE
         self._k32.OpenFileMappingW.argtypes = [
             wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
@@ -947,20 +1139,38 @@ class TelemetryBus:
     # -- mapping ------------------------------------------------------------
 
     def _map(self, writable):
-        handle = self._k32.CreateFileMappingW(
-            -1, None, 0x00000004, 0, self.capacity, self.name)
-        if not handle:
-            return False
-        # FILE_MAP_WRITE (0x0004) maps READ-ONLY on this build of Windows even
-        # though the section itself is PAGE_READWRITE -- writing through it
-        # faults.  FILE_MAP_ALL_ACCESS works; readers still use FILE_MAP_READ.
+        # Map again only after releasing the old view: otherwise the handle
+        # and the view of the previous mapping leak.
+        self.close()
         access = FILE_MAP_ALL_ACCESS if writable else FILE_MAP_READ
-        ptr = self._k32.MapViewOfFile(handle, access, 0, 0, 0)
-        if not ptr:
-            self._k32.CloseHandle(handle)
-            return False
-        self._handle, self._ptr = handle, ptr
-        return True
+
+        with security_attributes(TELEMETRY_SDDL) as attributes:
+            for name in self.names:
+                # Prefer opening an existing mapping: creating a global one
+                # needs a privilege only services have, and a user process
+                # must not put its own session-local mapping in the way.
+                handle = self._k32.OpenFileMappingW(access, False, name)
+                if not handle and writable:
+                    # Only the writer creates the mapping.  A reader that
+                    # made a session-local one of its own would keep reading
+                    # that one, even after the service comes up with the
+                    # global one.
+                    handle = self._k32.CreateFileMappingW(
+                        -1, ctypes.byref(attributes) if attributes else None,
+                        0x00000004, 0, self.capacity, name)
+                if not handle:
+                    continue
+                # FILE_MAP_WRITE (0x0004) maps READ-ONLY on this build of
+                # Windows even though the section itself is PAGE_READWRITE --
+                # writing through it faults.  FILE_MAP_ALL_ACCESS works;
+                # readers still use FILE_MAP_READ.
+                ptr = self._k32.MapViewOfFile(handle, access, 0, 0, 0)
+                if not ptr:
+                    self._k32.CloseHandle(handle)
+                    continue
+                self._handle, self._ptr = handle, ptr
+                return True
+        return False
 
     def open_writer(self):
         return self._map(writable=True)
@@ -1047,6 +1257,38 @@ def build_sample(wall, pid, temps, rpms, duties):
            rpm_cpu if rpm_cpu is not None else "-",
            rpm_mem if rpm_mem is not None else "-",
            duties[0], duties[1]))
+
+
+def gears_from_sample(sample):
+    """(cpu_duty, mem_duty) out of a telemetry sample, or (None, None)."""
+    if not sample:
+        return None, None
+    return (parse_gear(sample.get("duty_cpu")),
+            parse_gear(sample.get("duty_mem")))
+
+
+def live_gears(max_age=TELEMETRY_MAX_AGE):
+    """The gear a running governor is applying, read from the bus.
+
+    There is no way to read the duty back from the hardware: GetFanControl
+    returns packed *RPM*, and PowerSwitchInterface exposes no getter for the
+    setting.  So the only live source of the gear is the governor that set
+    it, and it publishes it on the bus -- no file on disk involved.
+
+    -> (cpu_duty, mem_duty, source).  The duties are None when no governor
+    is publishing, i.e. when the gear cannot be told at all.
+    """
+    bus = TelemetryBus()
+    try:
+        if not bus.open_reader():
+            return None, None, None
+        sample = bus.read()
+    finally:
+        bus.close()
+    if not TelemetryBus.is_live(sample, max_age):
+        return None, None, None
+    cpu, mem = gears_from_sample(sample)
+    return cpu, mem, "fanguard"
 
 
 def _fmt_num(value):

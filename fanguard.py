@@ -23,6 +23,20 @@ a small hysteresis band stops it flip-flopping at the boundary.
     fanguard --dry-run            log decisions, never touch the fans
     fanguard --cpu-max-at 68 --mem-max-at 72
 
+As a Windows service (the normal way to run it):
+
+    fanguard --service            started by the service control manager
+    fanguard --install-service    register it (Administrator)
+    fanguard --uninstall-service  remove it again (Administrator)
+    fanguard --start-service      start the installed service
+    fanguard --stop-service       stop it (the fans go back to AUTO)
+
+Once installed it comes up with the machine and is controlled with the
+usual tools:
+
+    net start fa880-fan      net stop fa880-fan
+    sc  start fa880-fan      sc  stop fa880-fan
+
 Sensors used (auto-detected, first match wins):
 
     CPU     "Core (Tctl/Tdie)"          -> drives the CPU fan
@@ -37,10 +51,10 @@ additionally needs LibreHardwareMonitor's own PawnIO driver, which it loads
 by itself -- nothing has to be installed.  Needs pythonnet:
 pip install pythonnet
 
-Safety: on exit -- normally, on Ctrl+C, or when the console window is
-closed -- the fans are handed back to the firmware AUTO curve, unless
---no-restore is given.  A hard kill (taskkill /F) cannot be caught and
-does skip that.
+Safety: on exit -- normally, on Ctrl+C, when the console window is closed,
+or when the service is stopped -- the fans are handed back to the firmware
+AUTO curve, unless --no-restore is given.  A hard kill (taskkill /F) cannot
+be caught and does skip that.
 """
 
 from __future__ import annotations
@@ -56,10 +70,6 @@ import fanlib as fan
 HERE = os.path.dirname(os.path.abspath(__file__))
 VENDOR_DIR = os.path.join(HERE, "vendor", "LibreHardwareMonitor")
 
-# Where a stop request is left.  fanlib owns it so the elevating launcher
-# can ask its child to shut down cleanly too.
-STOP_FILE = fan.STOP_FILE
-
 DEFAULT_INTERVAL = 3.0
 DEFAULT_STEP = 5
 DEFAULT_MIN = fan.GUI_MIN
@@ -72,6 +82,13 @@ AUTO_BELOW = 50
 CPU_MAX_AT = 70
 MEM_MAX_AT = 75
 DEFAULT_HYST = 3
+
+# Under pythonw (the background daemon) there is no console at all: sys.stdout
+# is None and nobody can see the live display.  The elevated child must then
+# write to the null device instead of a relay log in %TEMP% that would grow
+# for as long as the daemon runs.  Captured here, before init_console()
+# replaces the missing stream with a sink.
+QUIET = sys.stdout is None
 
 
 # --------------------------------------------------------------------------
@@ -322,8 +339,8 @@ def _clamp(value, low, high):
 class Log:
     """Kept in memory by default.
 
-    A file is only written when --log is given explicitly: an unattended
-    fanguard-start should not grow a log file forever, and touching the disk
+    A file is only written when --log is given explicitly: the service runs
+    unattended and should not grow a log file forever, and touching the disk
     on every tick is pointless wear.
     """
 
@@ -398,7 +415,8 @@ def render_frame(temps, cpu, mem, started, interval, failures,
     return "\n".join(lines)
 
 
-def run(args, thermo, fan_iface, log, drives_fans=True):
+def run(args, thermo, fan_iface, log, extra_stop=None, display=True,
+        publish=False):
     cpu = Governor("CPU fan", args.auto_below, args.cpu_max_at,
                    args.hysteresis, args.min_duty,
                    args.max_duty, args.step)
@@ -406,8 +424,11 @@ def run(args, thermo, fan_iface, log, drives_fans=True):
                    args.hysteresis, args.min_duty,
                    args.max_duty, args.step)
 
-    writer = fan.FrameWriter(getattr(args, "ansi", False)
-                             or sys.stdout.isatty())
+    if display:
+        writer = fan.FrameWriter(getattr(args, "ansi", False)
+                                 or sys.stdout.isatty())
+    else:
+        writer = fan.NullWriter()      # the service has no console
     parent = fan.parent_handle(getattr(args, "parent_pid", None))
     started = time.time()
 
@@ -418,6 +439,7 @@ def run(args, thermo, fan_iface, log, drives_fans=True):
         bus = None
 
     failures = 0
+    failed = False
     last = {"cpu": None, "mem": None}
     decided = {"cpu": None, "mem": None}   # dry-run bookkeeping only
     next_tick = started
@@ -425,20 +447,14 @@ def run(args, thermo, fan_iface, log, drives_fans=True):
 
     try:
         while not fan.parent_gone(parent):
+            if extra_stop is not None and extra_stop():
+                # The service control manager asked us to stop.
+                writer.banner("stop requested by the service manager")
+                break
             if fan.close_requested():
                 # The window was closed: shut down in an orderly way so the
                 # finally block can hand the fans back to AUTO.
                 writer.banner("window closed, shutting down")
-                break
-            if drives_fans and fan.stop_requested():
-                # Asked to stop: clean up and leave AUTO in charge.  Only the
-                # instance that actually drives the fans may act on this --
-                # a --dry-run must not swallow the request meant for it.
-                try:
-                    os.remove(STOP_FILE)
-                except OSError:
-                    pass
-                writer.banner("stop requested, shutting down")
                 break
             if deadline is not None and time.time() >= deadline:
                 writer.banner("duration reached, stopping")
@@ -473,10 +489,12 @@ def run(args, thermo, fan_iface, log, drives_fans=True):
                 log.text("# %d consecutive ticks with no reading for %s, "
                          "bailing out" % (failures, "/".join(missing)))
                 writer.banner("sensor failure, giving up")
+                # Not a clean stop: the service has to exit with an error
+                # code, or the service control manager would treat it as a
+                # normal stop and never run the failure actions.
+                failed = True
                 break
 
-            changed = False          # per-tick: only write the state file
-                                    # when a duty actually changed
             for gov, key, number in ((cpu, "cpu", fan.FAN_CPU),
                                      (mem, "mem", fan.FAN_MEM)):
                 new, action = gov.decide(temps[key])
@@ -509,11 +527,6 @@ def run(args, thermo, fan_iface, log, drives_fans=True):
                     continue
                 last[key] = new
                 gov.applied = new       # now it is really in effect
-                changed = True
-
-            if not args.dry_run and changed:
-                if last["cpu"] is not None or last["mem"] is not None:
-                    fan.write_state(last["cpu"], last["mem"], "fanguard")
 
             rpms = None
             if not args.dry_run:
@@ -523,7 +536,7 @@ def run(args, thermo, fan_iface, log, drives_fans=True):
                     rpms = None
             log.row(time.strftime("%Y-%m-%d %H:%M:%S"), temps, cpu, mem,
                     rpms, args.dry_run)
-            if bus is not None and not args.dry_run:
+            if bus is not None and publish:
                 bus.publish(fan.build_sample(
                     time.time(), os.getpid(), temps, rpms,
                     (cpu.duty_text().strip(), mem.duty_text().strip())))
@@ -554,7 +567,565 @@ def run(args, thermo, fan_iface, log, drives_fans=True):
         if bus is not None:
             bus.close()      # release the shared mapping + its handle
 
+    return fan.EXIT_ERROR if failed else 0
+
+
+# --------------------------------------------------------------------------
+# Windows service
+# --------------------------------------------------------------------------
+# The governor runs as a Windows service: it comes up with the machine, it is
+# controlled with the usual tools, and it survives the user logging out.
+#
+#     net start fa880-fan      net stop fa880-fan
+#     sc  start fa880-fan      sc  stop fa880-fan
+#
+# It runs as LocalSystem -- the WMI fan interface and the PawnIO sensor
+# driver both need administrator rights -- and publishes its samples on the
+# shared memory bus, so fanspeed still works without asking for elevation.
+
+SERVICE_NAME = fan.SERVICE_NAME
+SERVICE_DISPLAY_NAME = "FA880 Fan Governor"
+SERVICE_DESCRIPTION = ("CPU / memory fan governor for the FA880 PRO: both "
+                       "fans are driven from the measured temperature.")
+
+EVENT_SOURCE = "fa880-fan"
+
+# Event ids.  They are arbitrary but must stay stable.
+EVT_STARTED = 1
+EVT_STOPPED = 2
+EVT_ERROR = 3
+EVT_INFO = 4
+
+SEVERITY_ERROR = 1
+SEVERITY_WARNING = 2
+SEVERITY_INFO = 4
+
+
+class EventLog:
+    """The service's only visible output.
+
+    A service has no console, so without the event log a refusal to start
+    or a crash would be completely silent.  Only life cycle events and
+    errors are reported -- never one line per tick.
+    """
+
+    def __init__(self, source=EVENT_SOURCE):
+        self.source = source
+        self._registered = False
+
+    def register(self) -> bool:
+        """Make sure the event source exists (needs Administrator).
+
+        The installer registers it, so in the normal case there is nothing
+        to write -- and the registry hive is a file on disk.
+        """
+        if self._registered:
+            return True
+        try:
+            import win32api
+            import win32con
+            key = (r"SYSTEM\CurrentControlSet\Services\EventLog\Application"
+                   r"\%s" % self.source)
+            try:
+                handle = win32api.RegOpenKeyEx(
+                    win32con.HKEY_LOCAL_MACHINE, key, 0, win32con.KEY_READ)
+            except Exception:
+                pass
+            else:
+                win32api.RegCloseKey(handle)
+                self._registered = True
+                return True
+            import win32evtlogutil
+            win32evtlogutil.AddSourceToRegistry(self.source)
+            self._registered = True
+        except Exception:
+            self._registered = False
+        return self._registered
+
+    def report(self, event_id, message, severity=SEVERITY_INFO) -> None:
+        try:
+            import win32evtlogutil
+            if not self._registered:
+                self.register()
+            win32evtlogutil.ReportEvent(self.source, event_id, 0, severity,
+                                        (str(message),))
+        except Exception:
+            pass          # the event log must never break the governor
+
+
+class Reporter:
+    """Where the governor's messages go.
+
+    Foreground: the console.  Service: the Windows event log, because a
+    service has no console to print to.
+    """
+
+    def __init__(self, echo=True, event_log=None):
+        self.echo = echo
+        self.event_log = event_log
+
+    def say(self, message, severity=SEVERITY_INFO) -> None:
+        if self.echo:
+            print(message)
+        if self.event_log is not None:
+            self.event_log.report(EVT_INFO, message, severity)
+
+
+def _build_service_class():
+    """Create the ServiceFramework subclass (pywin32 must be importable)."""
+    import win32serviceutil
+
+    class _Service(win32serviceutil.ServiceFramework):
+        _svc_name_ = SERVICE_NAME
+        _svc_display_name_ = SERVICE_DISPLAY_NAME
+        _svc_description_ = SERVICE_DESCRIPTION
+
+        def __init__(self, args):
+            win32serviceutil.ServiceFramework.__init__(self, args)
+            self.stop_requested = False
+            self.event_log = EventLog()
+
+        # -- SCM callbacks ---------------------------------------------------
+
+        def SvcDoRun(self):
+            self.event_log.report(EVT_STARTED, "fanguard service starting")
+            try:
+                code = govern(SERVICE_ARGS, drives_fans=True,
+                              reporter=Reporter(echo=False,
+                                                event_log=self.event_log),
+                              extra_stop=self._should_stop, display=False,
+                              can_drive=fan.is_admin())
+            except Exception as exc:
+                # Let the exception reach the framework: it turns the
+                # service into "stopped with an error", which is what makes
+                # the configured failure actions restart it.
+                self.event_log.report(EVT_ERROR, "fanguard service failed: "
+                                      "%s: %s" % (type(exc).__name__, exc),
+                                      SEVERITY_ERROR)
+                raise
+            if code:
+                # Same reason: only a clean stop may exit with zero, or the
+                # failure actions would never fire.
+                self.event_log.report(EVT_ERROR, "fanguard service stopped "
+                                      "with error %d" % code, SEVERITY_ERROR)
+                raise RuntimeError("the governor stopped with code %d" % code)
+            self.event_log.report(EVT_STOPPED, "fanguard service stopped")
+            return code
+
+        def SvcStop(self):
+            # `net stop` / `sc stop`: the governor notices within a fraction
+            # of a second, hands the fans back to AUTO and exits.
+            self.event_log.report(EVT_INFO, "stop requested")
+            self.stop_requested = True
+
+        def SvcShutdown(self):
+            # The machine is going down: same path, so the fans end up on
+            # the firmware curve.
+            self.stop_requested = True
+
+        def _should_stop(self):
+            return self.stop_requested
+
+    return _Service
+
+
+SERVICE_ARGS = None       # the parsed governor options, set before dispatch
+
+
+def run_as_service() -> int:
+    """Hand over to the Windows service control manager."""
+    import servicemanager
+
+    servicemanager.Initialize()
+    servicemanager.PrepareToHostSingle(_build_service_class())
+    servicemanager.StartServiceCtrlDispatcher()
     return 0
+
+
+def _service_paths(options):
+    """Make a relative --log path absolute.
+
+    The SCM starts the service with the system directory as the working
+    directory, so a relative path would end up in C:\\Windows\\System32
+    instead of next to the tool.
+    """
+    out = []
+    expect_path = False
+    for arg in options:
+        if expect_path:
+            expect_path = False
+            if not os.path.isabs(arg):
+                arg = os.path.join(HERE, arg)
+            out.append(arg)
+            continue
+        if arg == "--log":
+            expect_path = True
+            out.append(arg)
+            continue
+        if arg.startswith("--log="):
+            value = arg.split("=", 1)[1]
+            if value and not os.path.isabs(value):
+                arg = "--log=" + os.path.join(HERE, value)
+        out.append(arg)
+    return out
+
+
+def service_command_line(options=None) -> str:
+    """The command line the service is started with.
+
+    pythonw.exe, so the service never has a console window; the script
+    path is absolute, because the SCM starts the service with the system
+    directory as the working directory.
+
+    The options are quoted by list2cmdline, which does it the way the SCM
+    splits it again: a naive "wrap it in quotes" would turn a path that
+    ends in a backslash into a different path.
+    """
+    import subprocess
+
+    interpreter = sys.executable
+    if interpreter.lower().endswith("python.exe"):
+        windowless = os.path.join(os.path.dirname(interpreter), "pythonw.exe")
+        if os.path.isfile(windowless):
+            interpreter = windowless
+    script = os.path.abspath(__file__)
+    return subprocess.list2cmdline(
+        [interpreter, script, "--service"] + _service_paths(options or []))
+
+
+def _service_options(argv):
+    """The governor options to hand over to the service.
+
+    Everything the user asked for, minus the flags that only concern the
+    process doing the installing and the ones the elevating parent adds to
+    its child.  argparse cannot do this: it swallows the options it knows
+    about, and the service is the one that has to receive them.
+    """
+    internal = ("--no-elevate", "--ansi")
+    manage = ("--service", "--install-service", "--uninstall-service",
+              "--start-service", "--stop-service")
+    # A one-shot diagnostic: a service started with it would print the
+    # sensor list and exit again, leaving a service that does nothing.
+    oneshot = ("--list-sensors",)
+    options = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if arg in internal or arg in manage or arg in oneshot:
+            continue
+        if arg in ("--elev-log", "--parent-pid"):
+            skip = True                 # and its value
+            continue
+        if arg.startswith("--elev-log=") or arg.startswith("--parent-pid="):
+            continue
+        options.append(arg)
+    return options
+
+
+def install_service(options=None) -> int:
+    """Register the governor as a Windows service.  Needs Administrator."""
+    import win32service
+    import win32serviceutil
+    import winerror
+
+    command = service_command_line(options)
+    hscm = win32service.OpenSCManager(None, None,
+                                      win32service.SC_MANAGER_ALL_ACCESS)
+    created = False
+    try:
+        try:
+            handle = win32service.CreateService(
+                hscm, SERVICE_NAME, SERVICE_DISPLAY_NAME,
+                win32service.SERVICE_ALL_ACCESS,
+                win32service.SERVICE_WIN32_OWN_PROCESS,
+                win32service.SERVICE_AUTO_START,
+                win32service.SERVICE_ERROR_NORMAL,
+                command, None, 0, None, None, None)
+            created = True
+        except win32service.error as exc:
+            if exc.winerror != winerror.ERROR_SERVICE_EXISTS:
+                raise
+            # Already there: refresh the configuration instead.
+            handle = win32service.OpenService(
+                hscm, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS)
+            win32service.ChangeServiceConfig(
+                handle, win32service.SERVICE_WIN32_OWN_PROCESS,
+                win32service.SERVICE_AUTO_START,
+                win32service.SERVICE_ERROR_NORMAL,
+                command, None, 0, None, None, None, SERVICE_DISPLAY_NAME)
+        try:
+            win32service.ChangeServiceConfig2(
+                handle, win32service.SERVICE_CONFIG_DESCRIPTION,
+                SERVICE_DESCRIPTION)
+        except Exception:
+            pass
+        win32service.CloseServiceHandle(handle)
+    finally:
+        win32service.CloseServiceHandle(hscm)
+
+    # The event source, so the service can report what it is doing.
+    EventLog().register()
+
+    # Restart the service if it ever dies: a governor that silently stops
+    # would leave the fans wherever they were.
+    try:
+        import subprocess
+        for arguments in (["failure", SERVICE_NAME, "reset=", "86400",
+                           "actions=", "restart/5000/restart/10000/restart/30000"],
+                          ["failureflag", SERVICE_NAME, "1"]):
+            result = subprocess.run(["sc.exe"] + arguments, check=False,
+                                    capture_output=True, text=True)
+            if result.returncode:
+                print("  could not set the failure actions: %s"
+                      % (result.stderr or result.stdout).strip())
+    except Exception as exc:
+        print("  could not set the failure actions: %s" % exc)
+
+    print("service %s %s" % (SERVICE_NAME,
+                             "installed" if created else "updated"))
+    print("  start type : automatic (comes up with the machine)")
+    print("  account    : LocalSystem")
+    print("  command    : %s" % command)
+
+    # A running instance still uses the old command line, so restart it.
+    try:
+        hscm = win32service.OpenSCManager(None, None,
+                                          win32service.SC_MANAGER_CONNECT)
+        try:
+            handle = win32service.OpenService(
+                hscm, SERVICE_NAME, win32service.SERVICE_QUERY_STATUS)
+        except Exception:
+            handle = None
+        if handle is not None:
+            try:
+                running = (win32service.QueryServiceStatus(handle)[1]
+                            == win32service.SERVICE_RUNNING)
+            finally:
+                win32service.CloseServiceHandle(handle)
+            if running:
+                print("  restarting it so the new settings take effect ...")
+                win32serviceutil.StopService(SERVICE_NAME)
+                win32serviceutil.WaitForServiceStatus(
+                    SERVICE_NAME, win32service.SERVICE_STOPPED, 30)
+        win32service.CloseServiceHandle(hscm)
+    except Exception as exc:
+        print("  could not check the service state: %s" % exc)
+
+    try:
+        win32serviceutil.StartService(SERVICE_NAME)
+        win32serviceutil.WaitForServiceStatus(
+            SERVICE_NAME, win32service.SERVICE_RUNNING, 30)
+        print("  started")
+    except win32service.error as exc:
+        if exc.winerror != winerror.ERROR_SERVICE_ALREADY_RUNNING:
+            print("  could not start it: %s" % exc.strerror)
+            return fan.EXIT_ERROR
+        print("  already running")
+    except Exception as exc:
+        print("  it did not come up: %s" % exc)
+        print("  look in the event log (Application -> %s)" % EVENT_SOURCE)
+        return fan.EXIT_ERROR
+    return fan.EXIT_OK
+
+
+def uninstall_service() -> int:
+    """Remove the service again.  Needs Administrator."""
+    import win32service
+    import win32serviceutil
+    import winerror
+
+    hscm = win32service.OpenSCManager(None, None,
+                                      win32service.SC_MANAGER_ALL_ACCESS)
+    try:
+        try:
+            handle = win32service.OpenService(
+                hscm, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS)
+        except win32service.error as exc:
+            if exc.winerror == winerror.ERROR_SERVICE_DOES_NOT_EXIST:
+                print("service %s is not installed" % SERVICE_NAME)
+                return fan.EXIT_OK
+            raise
+
+        status = win32service.QueryServiceStatus(handle)[1]
+        if status != win32service.SERVICE_STOPPED:
+            print("stopping the service ...")
+            try:
+                win32serviceutil.StopService(SERVICE_NAME)
+                win32serviceutil.WaitForServiceStatus(
+                    SERVICE_NAME, win32service.SERVICE_STOPPED, 30)
+            except Exception as exc:
+                print("  could not stop it: %s" % exc)
+                win32service.CloseServiceHandle(handle)
+                return fan.EXIT_ERROR
+        win32service.DeleteService(handle)
+        win32service.CloseServiceHandle(handle)
+    finally:
+        win32service.CloseServiceHandle(hscm)
+
+    try:
+        import win32evtlogutil
+        win32evtlogutil.RemoveSourceFromRegistry(EVENT_SOURCE)
+    except Exception:
+        pass
+
+    print("service %s removed" % SERVICE_NAME)
+    print("  the fans are back on the firmware AUTO curve")
+    return fan.EXIT_OK
+
+
+def start_service() -> int:
+    """Start the installed service.  Needs Administrator."""
+    import win32service
+    import winerror
+    import win32serviceutil
+
+    try:
+        win32serviceutil.StartService(SERVICE_NAME)
+        win32serviceutil.WaitForServiceStatus(
+            SERVICE_NAME, win32service.SERVICE_RUNNING, 30)
+    except win32service.error as exc:
+        if exc.winerror == winerror.ERROR_SERVICE_ALREADY_RUNNING:
+            print("service %s is already running" % SERVICE_NAME)
+            return fan.EXIT_OK
+        print("could not start it: %s" % exc.strerror)
+        return fan.EXIT_ERROR
+    print("service %s started" % SERVICE_NAME)
+    return fan.EXIT_OK
+
+
+def stop_service() -> int:
+    """Stop the installed service.  Needs Administrator.
+
+    The service hands the fans back to AUTO on its way out, so this is the
+    clean way to give the fans back to the firmware.
+    """
+    import win32service
+    import winerror
+    import win32serviceutil
+
+    hscm = win32service.OpenSCManager(None, None,
+                                      win32service.SC_MANAGER_ALL_ACCESS)
+    try:
+        try:
+            handle = win32service.OpenService(
+                hscm, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS)
+        except win32service.error as exc:
+            if exc.winerror == winerror.ERROR_SERVICE_DOES_NOT_EXIST:
+                print("service %s is not installed" % SERVICE_NAME)
+                return fan.EXIT_OK
+            raise
+        win32service.CloseServiceHandle(handle)
+    finally:
+        win32service.CloseServiceHandle(hscm)
+
+    try:
+        win32serviceutil.StopService(SERVICE_NAME)
+        win32serviceutil.WaitForServiceStatus(
+            SERVICE_NAME, win32service.SERVICE_STOPPED, 30)
+    except win32service.error as exc:
+        if exc.winerror == winerror.ERROR_SERVICE_NOT_ACTIVE:
+            print("service %s is not running" % SERVICE_NAME)
+            return fan.EXIT_OK
+        print("could not stop it: %s" % exc.strerror)
+        return fan.EXIT_ERROR
+    except Exception as exc:
+        print("could not stop it: %s" % exc)
+        return fan.EXIT_ERROR
+    print("service %s stopped -- the fans are back on AUTO"
+          % SERVICE_NAME)
+    return fan.EXIT_OK
+
+
+def govern(args, drives_fans, reporter, extra_stop=None, display=True,
+           can_drive=False):
+    """The governor proper: sensors, fan interface, control loop.
+
+    Shared by the foreground mode and the service, so both take the
+    single-instance lock, both restore AUTO on the way out, and neither
+    starts twice.
+    """
+    # Only the process that actually drives the fans may take the lock.  A
+    # non-elevated launcher would otherwise grab it and the elevated child
+    # would then wrongly conclude that another instance is running.
+    # Read-only modes (--list-sensors, --dry-run) never touch the fans, so
+    # they must not be blocked by a running governor.
+    lock = None
+    if drives_fans and can_drive:
+        lock, message = fan.acquire_single_instance()
+        if lock is None:
+            reporter.say("ERROR: %s" % message, SEVERITY_ERROR)
+            reporter.say("Stop the running instance first "
+                         "(net stop %s)." % SERVICE_NAME, SEVERITY_ERROR)
+            return fan.EXIT_ERROR
+        reporter.say("  %s" % message)
+
+    thermo = Thermometer()
+    fan_iface = None
+    log = Log(args.log)
+    if display:
+        # Closing the console window must not leave the fans pinned: ask
+        # Windows to tell us, so we can shut down in an orderly way.
+        fan.install_console_handler()
+    try:
+        thermo.start()
+        reporter.say("LibreHardwareMonitor ready")
+        reporter.say("  sensors: %s" % thermo.describe())
+        reporter.say("  CPU fan   : AUTO below %d C, MAX at %d C"
+                     % (args.auto_below, args.cpu_max_at))
+        reporter.say("  memory fan: AUTO below %d C, MAX at %d C"
+                     % (args.auto_below, args.mem_max_at))
+
+        if args.list_sensors:
+            for hw in thermo._computer.Hardware:
+                hw.Update()
+                for s in hw.Sensors:
+                    if str(s.SensorType) == "Temperature":
+                        reporter.say("  %-14s %-34s = %s"
+                                     % (str(hw.HardwareType), str(s.Name),
+                                        _value(s)))
+            return 0
+
+        if not args.dry_run:
+            fan_iface = fan.FanInterface()
+        # Only the instance that really owns the fans may publish: a
+        # side process without the lock would otherwise overwrite the
+        # governor's samples on the bus.
+        return run(args, thermo, fan_iface, log,
+                   extra_stop=extra_stop, display=display,
+                   publish=bool(lock) and drives_fans)
+
+    except fan.FanError as exc:
+        reporter.say("ERROR: %s" % exc, SEVERITY_ERROR)
+        return fan.EXIT_ERROR
+    except KeyboardInterrupt:
+        if display:
+            print()
+        return 130
+    except Exception as exc:
+        if os.environ.get("FANCTL_TRACEBACK"):
+            raise
+        reporter.say("ERROR: unexpected failure: %s: %s"
+                     % (type(exc).__name__, exc), SEVERITY_ERROR)
+        return fan.EXIT_ERROR
+    finally:
+        # Hand the fans back to the firmware curve unless told otherwise.
+        # This comes BEFORE thermo.stop(): on a console close Windows only
+        # allows a few seconds, and tearing down the sensor driver first
+        # could hang and get us killed with the fans still pinned.
+        if fan_iface is not None and not args.no_restore \
+                and not args.list_sensors:
+            try:
+                fan_iface.set_duty(fan.FAN_CPU, fan.DUTY_AUTO)
+                fan_iface.set_duty(fan.FAN_MEM, fan.DUTY_AUTO)
+                reporter.say("fans returned to AUTO")
+            except fan.FanError as exc:
+                reporter.say("WARNING: could not restore AUTO: %s" % exc,
+                             SEVERITY_WARNING)
+        thermo.stop()
+        log.close()
+        fan.release_single_instance(lock)
 
 
 def main(argv=None) -> int:
@@ -594,6 +1165,19 @@ def main(argv=None) -> int:
                         help="print every temperature sensor and exit")
     parser.add_argument("--no-restore", action="store_true",
                         help="do not hand the fans back to AUTO on exit")
+    parser.add_argument("--service", action="store_true",
+                        help="run as a Windows service (started by the "
+                             "service control manager)")
+    parser.add_argument("--install-service", action="store_true",
+                        help="register the Windows service and start it "
+                             "(Administrator)")
+    parser.add_argument("--uninstall-service", action="store_true",
+                        help="stop and remove the Windows service "
+                             "(Administrator)")
+    parser.add_argument("--start-service", action="store_true",
+                        help="start the Windows service (Administrator)")
+    parser.add_argument("--stop-service", action="store_true",
+                        help="stop the Windows service (Administrator)")
     parser.add_argument("--ansi", action="store_true",
                         default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument("--no-elevate", action="store_true",
@@ -603,106 +1187,63 @@ def main(argv=None) -> int:
     parser.add_argument("--parent-pid", metavar="PID", type=int,
                         default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
+    argv = list(sys.argv[1:] if argv is None else argv)
+    service_mode = any(flag in argv for flag in
+                       ("--service", "--install-service", "--uninstall-service",
+                        "--start-service", "--stop-service"))
+    # The options for the service come from the raw command line, not from
+    # argparse: it consumes the ones it knows about, and the service is the
+    # one that has to receive them.
+    options = _service_options(argv) if service_mode else []
     args = parser.parse_args(argv)
 
     elev_log = getattr(args, "elev_log", None)
     if elev_log:
         fan.install_elev_log(elev_log)
 
+    # -- service plumbing ---------------------------------------------------
+    # These do not need the governor at all, and the installer has to work
+    # before the service exists.
+    if (args.install_service or args.uninstall_service
+            or args.start_service or args.stop_service):
+        if not fan.is_admin():
+            return fan.ensure_admin(
+                reason="Managing a Windows service needs Administrator.")
+        if args.install_service:
+            return install_service(options)
+        if args.uninstall_service:
+            return uninstall_service()
+        if args.start_service:
+            return start_service()
+        return stop_service()
+
+    if args.service:
+        # Started by the service control manager: it runs as LocalSystem,
+        # so it is already administrator and must not try to elevate.
+        global SERVICE_ARGS
+        SERVICE_ARGS = args
+        return run_as_service()
+
     if not elev_log and not getattr(args, "no_elevate", False):
         if not fan.is_admin():
             # elevate_stream(), not ensure_admin(): fanguard runs for a long
             # time, so the child's output has to be relayed live rather than
             # dumped in one go when it finally exits.
+            #
+            # Unattended (pythonw without a console) nobody is going to read
+            # that output, so it is thrown away instead of being written to
+            # a relay file for the whole life of the run.
             print("fanguard needs Administrator to read temperatures and "
                   "drive the fans.")
             print("Requesting elevation...")
-            return fan.elevate_stream()
+            return fan.elevate_stream(quiet=QUIET)
 
-    # Only the process that actually drives the fans may take the lock.  A
-    # non-elevated launcher would otherwise grab it and the elevated child
-    # would then wrongly conclude that another instance is running.
-    # Read-only modes (--list-sensors, --dry-run) never touch the fans, so
-    # they must not be blocked by a running governor.
-    lock = None
+    # The governor may only touch the fans when it is actually allowed to
+    # (administrator rights); govern() takes the single-instance lock.
     drives_fans = not args.dry_run and not args.list_sensors
-    if drives_fans and (elev_log or fan.is_admin()):
-        lock, message = fan.acquire_single_instance()
-        if lock is None:
-            print("ERROR: %s" % message, file=sys.stderr)
-            print("Use fanguard-stop.bat to stop the running instance.",
-                  file=sys.stderr)
-            return fan.EXIT_ERROR
-        print("  %s" % message)
+    can_drive = bool(elev_log) or fan.is_admin()
 
-        # Only the instance that owns the governor may clear a stop request:
-        # a --dry-run must never eat the request meant for the real one.
-        # Do it here, before the sensor driver loads, so the window in which
-        # a fresh request could be discarded is as small as possible.
-        try:
-            os.remove(STOP_FILE)
-        except OSError:
-            pass
-
-    thermo = Thermometer()
-    fan_iface = None
-    log = Log(args.log)
-    # Closing the console window must not leave the fans pinned: ask Windows
-    # to tell us, so we can shut down in an orderly way.
-    fan.install_console_handler()
-    try:
-        thermo.start()
-        print("LibreHardwareMonitor ready")
-        print("  sensors: %s" % thermo.describe())
-        print("  CPU fan   : AUTO below %d C, MAX at %d C"
-              % (args.auto_below, args.cpu_max_at))
-        print("  memory fan: AUTO below %d C, MAX at %d C"
-              % (args.auto_below, args.mem_max_at))
-
-        if args.list_sensors:
-            for hw in thermo._computer.Hardware:
-                hw.Update()
-                for s in hw.Sensors:
-                    if str(s.SensorType) == "Temperature":
-                        print("  %-14s %-34s = %s"
-                              % (str(hw.HardwareType), str(s.Name),
-                                 _value(s)))
-            return 0
-
-        if not args.dry_run:
-            fan_iface = fan.FanInterface()
-        return run(args, thermo, fan_iface, log, drives_fans)
-
-    except fan.FanError as exc:
-        print("ERROR: %s" % exc, file=sys.stderr)
-        return fan.EXIT_ERROR
-    except KeyboardInterrupt:
-        print()
-        return 130
-    except Exception as exc:
-        if os.environ.get("FANCTL_TRACEBACK"):
-            raise
-        print("ERROR: unexpected failure: %s: %s"
-              % (type(exc).__name__, exc), file=sys.stderr)
-        return fan.EXIT_ERROR
-    finally:
-        # Hand the fans back to the firmware curve unless told otherwise.
-        # This comes BEFORE thermo.stop(): on a console close Windows only
-        # allows a few seconds, and tearing down the sensor driver first
-        # could hang and get us killed with the fans still pinned.
-        if fan_iface is not None and not args.no_restore \
-                and not args.list_sensors:
-            try:
-                fan_iface.set_duty(fan.FAN_CPU, fan.DUTY_AUTO)
-                fan_iface.set_duty(fan.FAN_MEM, fan.DUTY_AUTO)
-                fan.write_state(fan.DUTY_AUTO, fan.DUTY_AUTO, "fanguard")
-                print("fans returned to AUTO")
-            except fan.FanError as exc:
-                print("WARNING: could not restore AUTO: %s" % exc,
-                      file=sys.stderr)
-        thermo.stop()
-        log.close()
-        fan.release_single_instance(lock)
+    return govern(args, drives_fans, Reporter(), can_drive=can_drive)
 
 
 if __name__ == "__main__":
