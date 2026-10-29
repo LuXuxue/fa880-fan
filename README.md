@@ -25,8 +25,10 @@ CPU 风扇与内存风扇的独立命令行控制、实时转速显示、温度�
 ## 安装
 
 ```powershell
-pip install pywin32 pythonnet
+pip install -r requirements.txt
 ```
+
+（等价于 `pip install pywin32 pythonnet`；Python 3.14 需要 pywin32 ≥ 311、pythonnet ≥ 3.1。）
 
 需要**管理员权限**。非管理员运行时会自动弹 UAC 提权，并把提权子进程的输出回显到当前终端。
 

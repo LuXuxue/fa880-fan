@@ -1,0 +1,11 @@
+# FA880 fan control -- Windows only.
+#
+# Python 3.14 (64-bit) is supported by both packages below:
+#   pywin32   311 is the first release with cp314 wheels (services, win32 API)
+#   pythonnet 3.1 is the first release with cp314 wheels (loads the bundled
+#             LibreHardwareMonitor .NET assemblies for temperature readings)
+#
+# clr_loader and cffi are installed automatically as pythonnet dependencies.
+
+pywin32>=311
+pythonnet>=3.1.0,<4
